@@ -118,7 +118,10 @@ _zal_on_tick() {
   if [[ -n $reason ]]; then
     # Ticker died (unexpected); just clean up.
     zle -F $fd 2>/dev/null
-    exec {fd}<&- 2>/dev/null
+    # Wrap close in `{ ... } 2>/dev/null` so the redirect is scoped to the
+    # group; a bare `exec {fd}<&- 2>/dev/null` would silently set the
+    # shell's stderr to /dev/null permanently.
+    { exec {fd}<&- } 2>/dev/null
     _ZAL_TICK_FD=0
     return
   fi
@@ -131,7 +134,9 @@ _zal_stop_spinner() {
     zle -F $_ZAL_TICK_FD 2>/dev/null
     # Closing the read fd makes the ticker subshell get SIGPIPE on its next
     # write (within ZAL_SPINNER_INTERVAL seconds) and exit.
-    exec {_ZAL_TICK_FD}<&- 2>/dev/null
+    # Brace group scopes the 2>/dev/null to the close; a bare
+    # `exec {fd}<&- 2>/dev/null` would permanently silence the shell's stderr.
+    { exec {_ZAL_TICK_FD}<&- } 2>/dev/null
     _ZAL_TICK_FD=0
   fi
 }
@@ -308,7 +313,9 @@ _zal_cancel() {
 _zal_close_fd() {
   if (( _ZAL_FD != 0 )); then
     zle -F $_ZAL_FD 2>/dev/null
-    exec {_ZAL_FD}<&- 2>/dev/null
+    # Brace group scopes the 2>/dev/null to the close; a bare
+    # `exec {fd}<&- 2>/dev/null` would permanently silence the shell's stderr.
+    { exec {_ZAL_FD}<&- } 2>/dev/null
     _ZAL_FD=0
   fi
 }

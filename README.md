@@ -37,7 +37,7 @@ CLIs are available).
 ## Usage
 
 Place the cursor inside a command and press the key for your chosen backend.
-A spinner glyph (`⏳`) appears at the cursor while the backend is thinking;
+An animated spinner appears at the cursor while the backend is thinking;
 the keymap is locked during the wait.
 
 - **`^G`** cancels the in-flight request and restores the buffer.
@@ -63,7 +63,8 @@ Override any of these before sourcing the plugin (e.g. in `.zshrc`).
 | `ZAL_PROMPT_DIR` | `<plugin-dir>/prompts` | Directory holding system prompts |
 | `ZAL_CANCEL_KEY` | `^G` | Key that cancels an in-flight request |
 | `ZAL_CURSOR_MARK` | `§CURSOR§` | Marker passed to the LLM to indicate cursor position |
-| `ZAL_SPINNER_GLYPH` | `⏳` | Glyph shown at the cursor during the wait |
+| `ZAL_SPINNER_FRAMES` | braille spinner (10 frames) | Animation frames cycled through during the wait |
+| `ZAL_SPINNER_INTERVAL_CS` | `10` | Centiseconds (1/100 sec) between frame changes |
 
 ### Claude backend
 

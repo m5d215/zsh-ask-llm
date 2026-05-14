@@ -3,13 +3,18 @@
 # Supports multiple backends (claude, ollama, mock); each can be bound to its own key.
 
 zmodload zsh/system 2>/dev/null
+zmodload zsh/zselect 2>/dev/null  # for sub-second timer in the spinner ticker
 
 # === Shared configuration ===
 typeset -g  ZAL_PLUGIN_DIR=${0:A:h}
 typeset -g  ZAL_PROMPT_DIR=${ZAL_PROMPT_DIR:-$ZAL_PLUGIN_DIR/prompts}
 typeset -g  ZAL_CANCEL_KEY=${ZAL_CANCEL_KEY:-^G}
 typeset -g  ZAL_CURSOR_MARK=${ZAL_CURSOR_MARK:-§CURSOR§}
-typeset -g  ZAL_SPINNER_GLYPH=${ZAL_SPINNER_GLYPH:-⏳}
+if (( ${#ZAL_SPINNER_FRAMES[@]} == 0 )); then
+  typeset -ga ZAL_SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+fi
+# Centiseconds (1/100 sec) between spinner frames. 10 = 100ms.
+typeset -gi ZAL_SPINNER_INTERVAL_CS=${ZAL_SPINNER_INTERVAL_CS:-10}
 
 # === Per-backend configuration ===
 # Claude — agentic, slower, stronger context. Can read prompts/*.md and run Bash.
@@ -33,11 +38,14 @@ typeset -g  ZAL_MOCK_RESULT=${ZAL_MOCK_RESULT:-mocked-completion}
 # === Internal state ===
 typeset -g  _ZAL_SAVED_BUFFER=
 typeset -gi _ZAL_SAVED_CURSOR=0
+typeset -g  _ZAL_SAVED_POSTDISPLAY=
 typeset -g  _ZAL_PREV_KEYMAP=
 typeset -g  _ZAL_RESPONSE=
 typeset -g  _ZAL_CURRENT_BACKEND=
 typeset -gi _ZAL_FD=0
 typeset -gi _ZAL_PID=0
+typeset -gi _ZAL_TICK_FD=0
+typeset -gi _ZAL_SPINNER_IDX=0
 
 # === Locked keymap (one-shot at load time) ===
 _zal_install_keymap() {
@@ -69,13 +77,63 @@ _zal_unlock_and_replay() {
   zle -U -- "$KEYS"
 }
 
-# === Spinner rendering (static glyph at the cursor while waiting) ===
-_zal_show_spinner() {
+# === Animated spinner ===
+# Renders the current frame at the saved cursor. Defined as a widget so it can
+# be invoked from a `zle -F` callback context via `zle _zal_render_spinner`.
+_zal_render_spinner() {
+  local n=${#ZAL_SPINNER_FRAMES[@]}
+  (( n == 0 )) && return
+  local frame=${ZAL_SPINNER_FRAMES[$(( _ZAL_SPINNER_IDX % n + 1 ))]}
   local pre=${_ZAL_SAVED_BUFFER:0:$_ZAL_SAVED_CURSOR}
   local post=${_ZAL_SAVED_BUFFER:$_ZAL_SAVED_CURSOR}
-  BUFFER="${pre}${ZAL_SPINNER_GLYPH}${post}"
+  BUFFER="${pre}${frame}${post}"
   CURSOR=$_ZAL_SAVED_CURSOR
   zle -R
+  (( _ZAL_SPINNER_IDX++ ))
+}
+
+# Spawn a background ticker that writes one byte per interval. Each byte
+# triggers `_zal_on_tick`, which advances the spinner frame.
+# Uses zsh's `zselect -t` (centiseconds) instead of external `sleep` because
+# recent macOS BSD `sleep` rejects fractional seconds.
+_zal_start_spinner() {
+  _ZAL_SPINNER_IDX=0
+  _zal_render_spinner  # paint first frame immediately, before the first tick
+  exec {_ZAL_TICK_FD}< <(
+    # `zselect -t` returns non-zero on timeout (normal); ignore. The loop
+    # exits naturally when the reader closes its end and `print` gets SIGPIPE.
+    while :; do
+      print -n -- .
+      zselect -t ${ZAL_SPINNER_INTERVAL_CS:-10} 2>/dev/null
+    done
+  )
+  zle -F $_ZAL_TICK_FD _zal_on_tick
+}
+
+_zal_on_tick() {
+  emulate -L zsh
+  local -i fd=$1
+  local reason=$2
+  local junk
+  if [[ -n $reason ]]; then
+    # Ticker died (unexpected); just clean up.
+    zle -F $fd 2>/dev/null
+    exec {fd}<&- 2>/dev/null
+    _ZAL_TICK_FD=0
+    return
+  fi
+  sysread -i $fd junk 2>/dev/null
+  zle _zal_render_spinner
+}
+
+_zal_stop_spinner() {
+  if (( _ZAL_TICK_FD != 0 )); then
+    zle -F $_ZAL_TICK_FD 2>/dev/null
+    # Closing the read fd makes the ticker subshell get SIGPIPE on its next
+    # write (within ZAL_SPINNER_INTERVAL seconds) and exit.
+    exec {_ZAL_TICK_FD}<&- 2>/dev/null
+    _ZAL_TICK_FD=0
+  fi
 }
 
 # === Backends ===
@@ -108,7 +166,9 @@ _zal_run_ollama() {
 _zal_parse_ollama() { jq -r '.response // empty' 2>/dev/null }
 
 _zal_run_mock() {
-  sleep "$ZAL_MOCK_DELAY"
+  # Use zselect (centiseconds) instead of sleep so we don't depend on the
+  # external `sleep` accepting non-integer or empty input.
+  zselect -t $(( ${ZAL_MOCK_DELAY:-2} * 100 )) 2>/dev/null
   printf '{"result":"%s"}' "$ZAL_MOCK_RESULT"
 }
 _zal_parse_mock() { jq -r '.result // empty' 2>/dev/null }
@@ -127,6 +187,10 @@ _zal_run_request() {
   _ZAL_CURRENT_BACKEND=$backend
   _ZAL_SAVED_BUFFER=$BUFFER
   _ZAL_SAVED_CURSOR=$CURSOR
+  # Clear any inline overlay from zsh-autosuggestions (or similar) so the
+  # spinner doesn't render on top of it. Saved for restoration on cancel.
+  _ZAL_SAVED_POSTDISPLAY=${POSTDISPLAY-}
+  POSTDISPLAY=
   _ZAL_RESPONSE=
 
   # Save the keymap to restore later. Resolve "main" to its underlying keymap
@@ -152,9 +216,9 @@ _zal_run_request() {
   _ZAL_PID=$!  # may be empty for process substitution; cancel will degrade gracefully
   zle -F $_ZAL_FD _zal_on_data
 
-  # Lock input by switching the active keymap, and show the spinner glyph.
+  # Lock input by switching the active keymap, and start the animated spinner.
   zle -K zal-locked
-  _zal_show_spinner
+  _zal_start_spinner
 }
 
 # fd handler: drains output, finalizes on EOF/error.
@@ -177,6 +241,7 @@ _zal_on_data() {
 }
 
 _zal_finalize() {
+  _zal_stop_spinner
   _zal_close_fd
 
   local insertion
@@ -204,6 +269,13 @@ _zal_apply_insertion_widget() {
   local post=${_ZAL_SAVED_BUFFER:$_ZAL_SAVED_CURSOR}
   BUFFER="${pre}${insertion}${post}"
   CURSOR=$(( _ZAL_SAVED_CURSOR + ${#insertion} ))
+  # Clear the saved overlay; if zsh-autosuggestions is loaded, re-fetch a
+  # suggestion based on the new BUFFER.
+  POSTDISPLAY=
+  _ZAL_SAVED_POSTDISPLAY=
+  if (( $+functions[_zsh_autosuggest_fetch] )); then
+    _zsh_autosuggest_fetch 2>/dev/null
+  fi
 }
 
 _zal_cancel() {
@@ -218,9 +290,13 @@ _zal_cancel() {
   if (( _ZAL_PID != 0 )); then
     kill -TERM -- -$_ZAL_PID 2>/dev/null || kill -TERM -- $_ZAL_PID 2>/dev/null
   fi
+  _zal_stop_spinner
   _zal_close_fd
   BUFFER=$_ZAL_SAVED_BUFFER
   CURSOR=$_ZAL_SAVED_CURSOR
+  # Restore the inline overlay we cleared at request time.
+  POSTDISPLAY=$_ZAL_SAVED_POSTDISPLAY
+  _ZAL_SAVED_POSTDISPLAY=
   if [[ -n $_ZAL_PREV_KEYMAP ]]; then
     zle -K "$_ZAL_PREV_KEYMAP"
     _ZAL_PREV_KEYMAP=
@@ -246,6 +322,7 @@ zle -N _zal_request_mock
 zle -N _zal_cancel
 zle -N _zal_noop
 zle -N _zal_apply_insertion_widget
+zle -N _zal_render_spinner
 
 _zal_install_bindings() {
   [[ -n $ZAL_OLLAMA_KEYBIND ]] && bindkey "$ZAL_OLLAMA_KEYBIND" _zal_request_ollama
